@@ -18,6 +18,7 @@ from core.recommend_service import RecommendService
 from models.dto import RecommendResult, TrackRecommendation
 from utils.favorites import FavoritesStore, normalize_key
 from utils.history import SearchHistoryStore
+from utils.feedback import FeedbackStore
 
 
 class RecommendWorker(QObject):
@@ -42,14 +43,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Music Rec App (PySide6)")
-        self.resize(1320, 740)
+        self.resize(1340, 760)
 
         self.service = RecommendService()
 
         # Data
         self._items: list[TrackRecommendation] = []
         self._result: RecommendResult | None = None
-        self._all_items_cache: list[TrackRecommendation] = []  # to restore after filters
+        self._all_items_cache: list[TrackRecommendation] = []
 
         # Paths
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,9 @@ class MainWindow(QMainWindow):
 
         # History
         self.history = SearchHistoryStore(os.path.join(data_dir, "history.json"), max_items=50)
+
+        # Feedback
+        self.feedback = FeedbackStore(os.path.join(data_dir, "feedback.json"))
 
         self._setup_ui()
         self._setup_player()
@@ -119,6 +123,13 @@ class MainWindow(QMainWindow):
         self.btn_clear_favs = QPushButton("즐겨찾기 전체 삭제")
         sb.addWidget(self.btn_clear_favs)
 
+        sb.addSpacing(10)
+        sb.addWidget(QLabel("<b>Feedback</b>"))
+        self.btn_open_feedback_file = QPushButton("feedback.json 열기")
+        self.btn_clear_feedback = QPushButton("피드백 초기화(리셋)")
+        sb.addWidget(self.btn_open_feedback_file)
+        sb.addWidget(self.btn_clear_feedback)
+
         main_split.addWidget(sidebar)
 
         # Table
@@ -135,7 +146,7 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(3, 90)
         self.table.setColumnWidth(4, 90)
         self.table.setColumnWidth(5, 70)
-        self.table.setColumnWidth(6, 360)
+        self.table.setColumnWidth(6, 420)
 
         main_split.addWidget(self.table)
 
@@ -145,7 +156,7 @@ class MainWindow(QMainWindow):
         self.detail.setHtml("<b>결과를 선택하면 상세가 표시됩니다.</b>")
         main_split.addWidget(self.detail)
 
-        main_split.setSizes([240, 760, 320])
+        main_split.setSizes([240, 800, 320])
         outer.addWidget(main_split, 1)
 
         # Player bar
@@ -154,6 +165,12 @@ class MainWindow(QMainWindow):
         self.btn_open_lastfm = QPushButton("Last.fm")
         self.btn_open_itunes = QPushButton("iTunes")
         self.btn_open_preview = QPushButton("Preview 링크")
+
+        # Feedback buttons
+        self.btn_like = QPushButton("👍")
+        self.btn_dislike = QPushButton("👎")
+        self.btn_like.setToolTip("이 추천이 마음에 들어요 (학습)")
+        self.btn_dislike.setToolTip("이 추천은 별로예요 (학습)")
 
         self.btn_open_lastfm.setEnabled(False)
         self.btn_open_itunes.setEnabled(False)
@@ -170,6 +187,8 @@ class MainWindow(QMainWindow):
         player_bar.addWidget(self.btn_open_lastfm)
         player_bar.addWidget(self.btn_open_itunes)
         player_bar.addWidget(self.btn_open_preview)
+        player_bar.addWidget(self.btn_like)
+        player_bar.addWidget(self.btn_dislike)
         player_bar.addWidget(QLabel("Position"))
         player_bar.addWidget(self.slider_pos, 1)
         player_bar.addWidget(QLabel("Volume"))
@@ -188,12 +207,19 @@ class MainWindow(QMainWindow):
         self.btn_open_itunes.clicked.connect(self.on_open_itunes)
         self.btn_open_preview.clicked.connect(self.on_open_preview)
 
+        # Feedback signals
+        self.btn_like.clicked.connect(self.on_like)
+        self.btn_dislike.clicked.connect(self.on_dislike)
+
         # Sidebar signals
         self.list_history.itemClicked.connect(self.on_history_item_clicked)
         self.btn_clear_history.clicked.connect(self.on_clear_history)
         self.chk_favs_only.stateChanged.connect(self.on_toggle_favs_only)
         self.btn_show_favs_file.clicked.connect(self.open_favorites_file)
         self.btn_clear_favs.clicked.connect(self.clear_favorites)
+
+        self.btn_open_feedback_file.clicked.connect(self.open_feedback_file)
+        self.btn_clear_feedback.clicked.connect(self.clear_feedback)
 
         # Menu
         self._setup_menu()
@@ -208,8 +234,16 @@ class MainWindow(QMainWindow):
         act_export_txt = QAction("Export TXT", self)
         act_export_txt.triggered.connect(self.export_txt)
 
+        act_open_feedback = QAction("Open feedback file", self)
+        act_open_feedback.triggered.connect(self.open_feedback_file)
+
+        act_clear_feedback = QAction("Clear feedback", self)
+        act_clear_feedback.triggered.connect(self.clear_feedback)
+
         self.menuBar().addAction(act_export_csv)
         self.menuBar().addAction(act_export_txt)
+        self.menuBar().addAction(act_open_feedback)
+        self.menuBar().addAction(act_clear_feedback)
         self.menuBar().addAction(act_quit)
 
     # =========================
@@ -310,17 +344,14 @@ class MainWindow(QMainWindow):
         self._result = res
         items = res.items or []
 
-        # Personalization rerank
         items = self._personalized_rerank(items)
 
-        # Update rank after rerank
         for i, it in enumerate(items, start=1):
             it.rank = i
 
-        self._all_items_cache = items[:]  # keep full list
+        self._all_items_cache = items[:]
         self._items = items
 
-        # Apply filter (favorites only) if toggled
         if self.chk_favs_only.isChecked():
             self._items = [x for x in self._all_items_cache if self._is_favorite(x)]
             for i, it in enumerate(self._items, start=1):
@@ -389,7 +420,9 @@ class MainWindow(QMainWindow):
         preview = it.preview_url or "-"
         reason = getattr(it, "reason", "") or "-"
 
-        # Cover image (use artwork_url if present)
+        like_cnt, dislike_cnt, last = self.feedback.get_counts(it.track, it.artist)
+        last_txt = last if last else "-"
+
         cover_html = ""
         if getattr(it, "artwork_url", None):
             cover_html = f'<p><img src="{it.artwork_url}" width="160" height="160"/></p>'
@@ -402,6 +435,9 @@ class MainWindow(QMainWindow):
         <p><b>Tags:</b> {tags}</p>
         <p><b>Links:</b> {lastfm} | {itunes}</p>
         <p><b>Preview:</b> {preview}</p>
+        <hr/>
+        <p><b>Feedback:</b> 👍 {like_cnt} / 👎 {dislike_cnt} (last: {last_txt})</p>
+        <p style="color:gray;">선택 후 아래 👍/👎로 반영할 수 있어요.</p>
         """
         self.detail.setHtml(html)
 
@@ -420,6 +456,73 @@ class MainWindow(QMainWindow):
         if not sel:
             return None
         return sel[0].row()
+
+    def _current_item(self) -> TrackRecommendation | None:
+        row = self._selected_row()
+        if row is None:
+            return None
+        if row < 0 or row >= len(self._items):
+            return None
+        return self._items[row]
+
+    # =========================
+    # Feedback (👍 / 👎)
+    # =========================
+    def on_like(self):
+        it = self._current_item()
+        if not it:
+            QMessageBox.information(self, "Info", "선택된 곡이 없습니다.")
+            return
+        self.feedback.like(it.track, it.artist)
+        self.status.setText("👍 반영됨 (다음 추천/정렬에 적용)")
+        self._rerank_after_feedback()
+        self._refresh_detail_after_feedback()
+
+    def on_dislike(self):
+        it = self._current_item()
+        if not it:
+            QMessageBox.information(self, "Info", "선택된 곡이 없습니다.")
+            return
+        self.feedback.dislike(it.track, it.artist)
+        self.status.setText("👎 반영됨 (다음 추천/정렬에 적용)")
+        self._rerank_after_feedback()
+        self._refresh_detail_after_feedback()
+
+    def _refresh_detail_after_feedback(self):
+        it = self._current_item()
+        if it:
+            self._show_detail(it)
+
+    def open_feedback_file(self):
+        path = self.feedback.filepath
+        if not os.path.exists(path):
+            self.feedback.save()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def clear_feedback(self):
+        reply = QMessageBox.question(self, "Confirm", "피드백(👍/👎)을 모두 초기화할까요?")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.feedback.clear()
+        self.status.setText("피드백 초기화 완료")
+        self._rerank_after_feedback()
+        self._refresh_detail_after_feedback()
+
+    def _rerank_after_feedback(self):
+        if not self._all_items_cache:
+            return
+
+        self._all_items_cache = self._personalized_rerank(self._all_items_cache)
+
+        if self.chk_favs_only.isChecked():
+            self._items = [x for x in self._all_items_cache if self._is_favorite(x)]
+        else:
+            self._items = self._all_items_cache[:]
+
+        for i, it in enumerate(self._items, start=1):
+            it.rank = i
+
+        self._fill_table(self._items)
 
     # =========================
     # Favorites
@@ -442,14 +545,12 @@ class MainWindow(QMainWindow):
             self.favs.upsert(snap)
             self._fav_map[key] = snap
 
-        # Update fav button
         w = self.table.cellWidget(row, 5)
         if isinstance(w, QPushButton):
             w.setText("♥" if key in self._fav_map else "♡")
 
-        # Re-rank immediately
         self._all_items_cache = self._personalized_rerank(self._all_items_cache)
-        # Apply filter if toggled
+
         if self.chk_favs_only.isChecked():
             self._items = [x for x in self._all_items_cache if self._is_favorite(x)]
         else:
@@ -503,6 +604,8 @@ class MainWindow(QMainWindow):
                 s += 1000.0
             if isinstance(it.similarity, float):
                 s += it.similarity * 100.0
+
+            # favorites boosts
             if (it.artist or "").strip().lower() in fav_artists:
                 s += 60.0
             if it.tags and fav_tags:
@@ -510,6 +613,10 @@ class MainWindow(QMainWindow):
                 s += 10.0 * len(overlap)
             if self._is_favorite(it):
                 s += 80.0
+
+            # feedback boosts
+            s += float(self.feedback.score(it.track, it.artist))
+
             return s
 
         return sorted(items, key=score, reverse=True)
@@ -588,14 +695,6 @@ class MainWindow(QMainWindow):
         if url:
             QDesktopServices.openUrl(QUrl(url))
 
-    def _current_item(self) -> TrackRecommendation | None:
-        row = self._selected_row()
-        if row is None:
-            return None
-        if row < 0 or row >= len(self._items):
-            return None
-        return self._items[row]
-
     # =========================
     # Player controls
     # =========================
@@ -605,7 +704,6 @@ class MainWindow(QMainWindow):
         it = self._items[row]
         if not it.preview_url:
             return
-
         self.player.setSource(QUrl(it.preview_url))
         self.player.play()
 
