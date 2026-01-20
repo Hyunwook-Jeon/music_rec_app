@@ -16,7 +16,7 @@ class TrackRecommendation:
     itunes_url: Optional[str] = None
 
     tags: List[str] = field(default_factory=list)
-
+    reason: str = ""  
 
 @dataclass
 class RecommendResult:
